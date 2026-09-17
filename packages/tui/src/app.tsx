@@ -953,6 +953,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
             ? "Disable SKILL.state execution state"
             : "Enable SKILL.state execution state",
         category: "System",
+        slashName: "skill-state",
         run: async () => {
           const next = !(sync.data.config.experimental?.skill_state === true)
           await sdk.client.config.update({
