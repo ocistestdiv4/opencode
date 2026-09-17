@@ -965,7 +965,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
               },
               { throwOnError: true },
             )
-            sync.set("config", "experimental", "skill_state", next)
+            sync.set("config", "experimental", { ...sync.data.config.experimental, skill_state: next })
             toast.show({
               variant: "info",
               message: `SKILL.state ${next ? "enabled" : "disabled"}`,
