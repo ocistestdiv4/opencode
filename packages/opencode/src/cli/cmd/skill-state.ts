@@ -8,17 +8,11 @@ export const SkillStateCommand = effectCmd({
   describe:
     "Enable, disable, or show the SKILL.state bounded execution state mode for long-horizon tool loops (arXiv:2608.26263)",
   builder: (yargs) =>
-    yargs
-      .positional("state", {
-        describe: "'on' to enable, 'off' to disable. Omit to print the current status.",
-        type: "string",
-        choices: ["on", "off"] as const,
-      })
-      .option("global", {
-        describe: "Write to the global config instead of the current project's config",
-        type: "boolean",
-        default: false,
-      }),
+    yargs.positional("state", {
+      describe: "'on' to enable, 'off' to disable. Omit to print the current status.",
+      type: "string",
+      choices: ["on", "off"] as const,
+    }),
   handler: Effect.fn("Cli.skillState")(function* (args) {
     const config = yield* Config.Service
 
@@ -39,16 +33,13 @@ export const SkillStateCommand = effectCmd({
     }
 
     const enabled = args.state === "on"
-    if (args.global) {
-      yield* config.updateGlobal({ experimental: { skill_state: enabled } })
-    } else {
-      yield* config.update({ experimental: { skill_state: enabled } })
-    }
+    // Project-level config.update() writes config.json, which project config
+    // resolution never reads back (only opencode.json/opencode.jsonc), so it
+    // would silently have no effect. Global config is what's actually merged
+    // into every instance's resolved config.
+    yield* config.updateGlobal({ experimental: { skill_state: enabled } })
     UI.println(
-      UI.Style.TEXT_SUCCESS_BOLD +
-        `skill_state ${enabled ? "enabled" : "disabled"}` +
-        UI.Style.TEXT_NORMAL +
-        ` (${args.global ? "global" : "project"} config)`,
+      UI.Style.TEXT_SUCCESS_BOLD + `skill_state ${enabled ? "enabled" : "disabled"}` + UI.Style.TEXT_NORMAL,
     )
   }),
 })

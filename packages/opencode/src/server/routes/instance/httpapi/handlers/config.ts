@@ -16,7 +16,11 @@ export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (h
     })
 
     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
-      yield* configSvc.update(ctx.payload)
+      // configSvc.update() writes the project's config.json, but project config
+      // resolution only ever reads opencode.json/opencode.jsonc - config.json is
+      // never read back, so that write is silently inert. Use the global config
+      // instead, which is actually merged into every instance's resolved config.
+      yield* configSvc.updateGlobal(ctx.payload)
       yield* markInstanceForDisposal(yield* InstanceState.context)
       return ctx.payload
     })
