@@ -956,12 +956,28 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashName: "skill-state",
         run: async () => {
           const next = !(sync.data.config.experimental?.skill_state === true)
-          await sdk.client.config.update({
-            workspace: project.workspace.current(),
-            config: { experimental: { skill_state: next } },
-          })
-          sync.set("config", "experimental", "skill_state", next)
           dialog.clear()
+          try {
+            await sdk.client.config.update(
+              {
+                workspace: project.workspace.current(),
+                config: { experimental: { skill_state: next } },
+              },
+              { throwOnError: true },
+            )
+            sync.set("config", "experimental", "skill_state", next)
+            toast.show({
+              variant: "info",
+              message: `SKILL.state ${next ? "enabled" : "disabled"}`,
+              duration: 3000,
+            })
+          } catch (error) {
+            toast.show({
+              variant: "error",
+              message: `Failed to update skill_state: ${errorMessage(error)}`,
+              duration: 5000,
+            })
+          }
         },
       },
       {
