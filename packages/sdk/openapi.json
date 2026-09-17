@@ -21549,6 +21549,9 @@
               "continue_loop_on_deny": {
                 "type": "boolean"
               },
+              "skill_state": {
+                "type": "boolean"
+              },
               "mcp_timeout": {
                 "type": "integer",
                 "exclusiveMinimum": 0

@@ -137,6 +137,7 @@ const appBindingCommands = [
   "app.toggle.diffwrap",
   "app.toggle.paste_summary",
   "app.toggle.session_directory_filter",
+  "app.toggle.skill_state",
 ] as const
 
 export type TuiInput = {
@@ -942,6 +943,23 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         run: async () => {
           kv.set("session_directory_filter_enabled", !kv.get("session_directory_filter_enabled", true))
           await sync.session.refresh()
+          dialog.clear()
+        },
+      },
+      {
+        name: "app.toggle.skill_state",
+        title:
+          sync.data.config.experimental?.skill_state === true
+            ? "Disable SKILL.state execution state"
+            : "Enable SKILL.state execution state",
+        category: "System",
+        run: async () => {
+          const next = !(sync.data.config.experimental?.skill_state === true)
+          await sdk.client.config.update({
+            workspace: project.workspace.current(),
+            config: { experimental: { skill_state: next } },
+          })
+          sync.set("config", "experimental", "skill_state", next)
           dialog.clear()
         },
       },
