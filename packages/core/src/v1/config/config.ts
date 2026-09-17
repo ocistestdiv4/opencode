@@ -179,6 +179,14 @@ export const Info = Schema.Struct({
       continue_loop_on_deny: Schema.optional(Schema.Boolean).annotate({
         description: "Continue the agent loop when a tool call is denied",
       }),
+      skill_state: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Enable SKILL.state-style bounded execution state for long-horizon tool loops (arXiv:2608.26263). " +
+          "Instead of letting the conversation history grow with every step, compacts it after each step into " +
+          "a small structured state (goal, facts, completed/pending work) and discards the intermediate " +
+          "reasoning and tool output once the state is updated. Trades extra compaction calls for a context " +
+          "window that stays roughly constant size over very long sessions. Default: false.",
+      }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),

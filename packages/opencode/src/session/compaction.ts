@@ -20,7 +20,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { buildPrompt, buildStatePrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -378,13 +378,13 @@ const layer = Layer.effect(
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+      const skillState = cfg.experimental?.skill_state === true
       const nextPrompt =
         compacting.prompt ??
         [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
+          skillState
+            ? buildStatePrompt({ previousState: previousSummary, context: [conversation] })
+            : buildPrompt({ previousSummary, context: [conversation] }),
           ...compacting.context,
         ]
           .filter(Boolean)

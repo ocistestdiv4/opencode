@@ -173,6 +173,47 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
   ].join("\n\n")
 }
 
+const STATE_TEMPLATE = `Output exactly the JSON object shown inside <template>, and nothing else - no prose, no markdown fences. Do not include the <template> tags in your response.
+<template>
+{
+  "goal": "[one sentence: what the user is trying to accomplish]",
+  "facts": ["[constraint, decision, or fact worth keeping, terse]"],
+  "completed": ["[finished step or verified change]"],
+  "pending": ["[next concrete step, most urgent first]"],
+  "blocked": ["[blocker or open question]"],
+  "files": ["[path: why it matters]"]
+}
+</template>
+
+Rules:
+- Valid JSON only, matching the template's keys exactly. Use an empty array when there is nothing for a key.
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+- This is bounded execution state, not a transcript: merge, generalize, or drop entries instead of only appending, so the state does not grow every step.`
+
+const STATE_UPDATE_INSTRUCTIONS = `The <prior-state> is the execution state before the <conversation>. Produce a new state object that folds the <conversation> into it. The <prior-state> is discarded after this: anything you do not carry into the new state is lost.
+
+When updating:
+- Move finished "pending" items into "completed"; drop "completed" items that no longer matter for future steps.
+- The <conversation> is more recent than the <prior-state>. Where they conflict, the conversation wins.
+- Resolve blockers that no longer apply and drop them.
+- Keep the state minimal - it must not grow every step.`
+
+export const buildStatePrompt = (input: { readonly previousState?: string; readonly context: readonly string[] }) => {
+  const conversation = `Here is the latest activity:\n\n<conversation>\n${input.context.join("\n\n")}\n</conversation>`
+  if (!input.previousState)
+    return [
+      conversation,
+      "Create a bounded execution state from the <conversation> above so another coding agent can continue the work from the state alone.",
+      STATE_TEMPLATE,
+    ].join("\n\n")
+  return [
+    conversation,
+    `Here is the execution state before the <conversation> above:\n\n<prior-state>\n${input.previousState}\n</prior-state>`,
+    STATE_UPDATE_INSTRUCTIONS,
+    STATE_TEMPLATE,
+  ].join("\n\n")
+}
+
 export const make = (dependencies: Dependencies) => {
   const config = settings(dependencies.config)
   const compactAfterOverflow = Effect.fn("SessionCompaction.compactAfterOverflow")(function* (input: Input) {
