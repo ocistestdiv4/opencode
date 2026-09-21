@@ -261,7 +261,7 @@ const layer = Layer.effect(
         break
       }
 
-      if (!keep || keep.start === 0) return { head: input.messages, tail_start_id: undefined }
+      if (!keep) return { head: input.messages, tail_start_id: undefined }
       return {
         head: input.messages.slice(0, keep.start),
         tail_start_id: keep.id,
