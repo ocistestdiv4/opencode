@@ -262,7 +262,12 @@ const layer = Layer.effect(
         })
         if (split) keep = split
         else if (!keep) {
-          yield* Effect.logInfo("tail fallback", { budget, size, total })
+          // Even the single most recent turn alone exceeds the budget (e.g. one huge
+          // tool output). Keep it whole anyway rather than falling back to no tail at
+          // all - losing the latest observation entirely is worse than a one-time
+          // budget overrun, especially for skill_state's tight per-step budget.
+          yield* Effect.logInfo("tail fallback: keeping oversized latest turn whole", { budget, size, total })
+          keep = { start: turn.start, id: turn.id }
         }
         break
       }
