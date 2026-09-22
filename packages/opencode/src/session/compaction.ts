@@ -31,11 +31,6 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
-// skill_state compacts every step, not just on overflow, so it needs a much
-// tighter tail budget than the overflow-oriented default (which can reach
-// 15k tokens and let several steps' worth of raw content accumulate before
-// anything actually gets folded into the state).
-const SKILL_STATE_TAIL_BUDGET = 2_000
 type Turn = {
   start: number
   end: number
@@ -142,6 +137,16 @@ function turns(messages: SessionV1.WithParts[]) {
   return result
 }
 
+// skill_state has no token budget to weigh: per the paper, each step sees the
+// state plus exactly the latest observation, nothing more. Keep only the most
+// recent turn verbatim and fold everything before it into the state.
+function lastTurnOnly(messages: SessionV1.WithParts[]) {
+  const all = turns(messages)
+  const last = all.at(-1)
+  if (!last) return { head: messages, tail_start_id: undefined }
+  return { head: messages.slice(0, last.start), tail_start_id: last.id }
+}
+
 function splitTurn(input: {
   messages: SessionV1.WithParts[]
   turn: Turn
@@ -229,11 +234,10 @@ const layer = Layer.effect(
       messages: SessionV1.WithParts[]
       cfg: ConfigV1.Info
       model: Provider.Model
-      budgetOverride?: number
     }) {
       const limit = input.cfg.compaction?.tail_turns
       if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
-      const budget = input.budgetOverride ?? preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
       const all = turns(input.messages)
       if (!all.length) return { head: input.messages, tail_start_id: undefined }
       const recent = limit === undefined ? all : all.slice(-limit)
@@ -376,12 +380,10 @@ const layer = Layer.effect(
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
-      const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-        budgetOverride: skillState ? SKILL_STATE_TAIL_BUDGET : undefined,
-      })
+      const filteredHistory = history.filter((_, index) => !hidden.has(index))
+      const selected = skillState
+        ? lastTurnOnly(filteredHistory)
+        : yield* select({ messages: filteredHistory, cfg, model })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
