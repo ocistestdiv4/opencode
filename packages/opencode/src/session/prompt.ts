@@ -127,6 +127,33 @@ function capturedStateUpdate(msgs: SessionV1.WithParts[], assistantID: MessageID
   return part?.state.status === "completed" ? part.state.input : undefined
 }
 
+// The tail retained by a skill_state fold is shown to the model for exactly one extra
+// step so it still has the latest observation, then it's gone. Media in that observation
+// (screenshots, images a tool read) is already covered by whatever the state text says
+// about it, so re-sending the raw bytes for that one extra step is pure waste - strip it
+// from the request only, leaving the stored history untouched.
+function stripFoldedMedia(msgs: SessionV1.WithParts[], activeID: MessageID) {
+  return msgs.map((m) => {
+    if (m.info.id === activeID) return m
+    return {
+      ...m,
+      parts: m.parts.map((part) => {
+        if (part.type === "file" && MessageV2.isMedia(part.mime))
+          return {
+            id: part.id,
+            sessionID: part.sessionID,
+            messageID: part.messageID,
+            type: "text" as const,
+            text: `[Attached ${part.mime}: ${part.filename ?? "file"}]`,
+          }
+        if (part.type === "tool" && part.state.status === "completed" && part.state.attachments?.length)
+          return { ...part, state: { ...part.state, attachments: [] } }
+        return part
+      }),
+    }
+  })
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -1302,7 +1329,7 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(skillState ? stripFoldedMedia(msgs, lastUser.id) : msgs, model),
             ])
             const system = [
               ...env,
