@@ -192,6 +192,17 @@ export interface Interface {
     auto: boolean
     overflow?: boolean
   }) => Effect.Effect<void>
+  // Folds the just-finished turn into state without a compaction LLM call: the state
+  // patch already came from that turn's own generation (via the StateUpdate tool), so
+  // this only needs to write the marker/summary/continue messages that make it visible
+  // to the next step, matching what a real compaction pass would leave behind.
+  readonly applyStateUpdate: (input: {
+    sessionID: SessionID
+    parentID: MessageID
+    agent: string
+    model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    state: Record<string, unknown>
+  }) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -570,6 +581,80 @@ const layer = Layer.effect(
       return result
     })
 
+    const applyStateUpdate = Effect.fn("SessionCompaction.applyStateUpdate")(function* (input: {
+      sessionID: SessionID
+      parentID: MessageID
+      agent: string
+      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      state: Record<string, unknown>
+    }) {
+      const ctx = yield* InstanceState.context
+      const marker = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        model: input.model,
+        sessionID: input.sessionID,
+        agent: input.agent,
+        time: { created: Date.now() },
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: marker.id,
+        sessionID: input.sessionID,
+        type: "compaction",
+        auto: true,
+        tail_start_id: input.parentID,
+      })
+
+      const summary: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: marker.id,
+        sessionID: input.sessionID,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        cost: 0,
+        tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: input.model.modelID,
+        providerID: input.model.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* session.updateMessage(summary)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: JSON.stringify(input.state, null, 2),
+        time: { start: Date.now(), end: Date.now() },
+      })
+
+      const continueMsg = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: Date.now() },
+        agent: input.agent,
+        model: input.model,
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: continueMsg.id,
+        sessionID: input.sessionID,
+        type: "text",
+        // Same marker used by regular auto-compaction followups; see processCompaction.
+        metadata: { compaction_continue: true },
+        synthetic: true,
+        text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        time: { start: Date.now(), end: Date.now() },
+      })
+
+      yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+    })
+
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
       sessionID: SessionID
       agent: string
@@ -600,6 +685,7 @@ const layer = Layer.effect(
       prune,
       process: processCompaction,
       create,
+      applyStateUpdate,
     })
   }),
 )

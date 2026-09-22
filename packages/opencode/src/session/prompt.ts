@@ -81,6 +81,26 @@ IMPORTANT:
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
+// SKILL.state (arXiv:2608.26263): the state patch is produced in the same generation as
+// the turn's real action(s), not by a separate compaction call afterward.
+const STATE_UPDATE_SCHEMA = {
+  type: "object",
+  properties: {
+    goal: { type: "string", description: "One sentence: what the user is trying to accomplish." },
+    facts: { type: "array", items: { type: "string" }, description: "Constraints, decisions, or facts worth keeping." },
+    completed: { type: "array", items: { type: "string" }, description: "Finished steps or verified changes." },
+    pending: { type: "array", items: { type: "string" }, description: "Next concrete steps, most urgent first." },
+    blocked: { type: "array", items: { type: "string" }, description: "Blockers or open questions." },
+    files: { type: "array", items: { type: "string" }, description: "Relevant file paths and why they matter." },
+  },
+  required: ["goal"],
+  additionalProperties: false,
+} satisfies JSONSchema7
+
+const STATE_UPDATE_DESCRIPTION = `Record the complete current execution state. Call this every turn alongside your real action(s) - on the next turn you will not see this conversation again, only this recorded state and the latest observation. Always give the full up-to-date state, not just what changed: merge, generalize, or drop entries instead of only appending, so the state stays bounded rather than growing every turn.`
+
+const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see your last recorded state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, with the complete current state (goal, facts, completed, pending, blocked, files).`
+
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
   const padding = trimmed.endsWith("==") ? 2 : trimmed.endsWith("=") ? 1 : 0
@@ -97,6 +117,14 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
   return part.state.status === "error" && part.state.metadata?.interrupted === true
+}
+
+function capturedStateUpdate(msgs: SessionV1.WithParts[], assistantID: MessageID) {
+  const message = msgs.find((m) => m.info.role === "assistant" && m.info.id === assistantID)
+  const part = message?.parts.find(
+    (p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "StateUpdate" && p.state.status === "completed",
+  )
+  return part?.state.status === "completed" ? part.state.input : undefined
 }
 
 export interface Interface {
@@ -1158,14 +1186,25 @@ const layer = Layer.effect(
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            ((yield* config.get()).experimental?.skill_state === true ||
-              (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          if (lastFinished && lastFinished.summary !== true) {
+            const skillState = (yield* config.get()).experimental?.skill_state === true
+            const stateUpdate = skillState ? capturedStateUpdate(msgs, lastFinished.id) : undefined
+            if (stateUpdate) {
+              yield* compaction.applyStateUpdate({
+                sessionID,
+                parentID: lastUser.id,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                state: stateUpdate,
+              })
+              continue
+            }
+            // skill_state falls back here when the model didn't call StateUpdate this
+            // turn - the overflow check is the same safety net non-skill_state sessions use.
+            if (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })) {
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1250,6 +1289,9 @@ const layer = Layer.effect(
               })
             }
 
+            const skillState = (yield* config.get()).experimental?.skill_state === true
+            if (skillState) tools["StateUpdate"] = createStateUpdateTool()
+
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
@@ -1270,6 +1312,7 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            if (skillState) system.push(SKILL_STATE_SYSTEM_PROMPT)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1580,6 +1623,27 @@ export function createStructuredOutputTool(input: {
         output: "Structured output captured successfully.",
         title: "Structured Output",
         metadata: { valid: true },
+      }
+    },
+    toModelOutput({ output }) {
+      return {
+        type: "text",
+        value: output.output,
+      }
+    },
+  })
+}
+
+/** @internal Exported for testing */
+export function createStateUpdateTool(): AITool {
+  return tool({
+    description: STATE_UPDATE_DESCRIPTION,
+    inputSchema: jsonSchema(STATE_UPDATE_SCHEMA),
+    async execute() {
+      return {
+        output: "State recorded.",
+        title: "State recorded",
+        metadata: {},
       }
     },
     toModelOutput({ output }) {
