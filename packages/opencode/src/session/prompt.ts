@@ -112,6 +112,7 @@ const STATE_UPDATE_MAX_RETRIES = 1
 const STATE_UPDATE_MAX_CHARS = 4_000
 const STATE_UPDATE_RETRY_PROMPT = `You did not call StateUpdate this turn. Call it now, reporting the delta for this turn (it can be empty if nothing changed), before continuing.`
 const STATE_UPDATE_TOO_LARGE_PROMPT = `The state produced by your last StateUpdate call is too large. Call it again with a smaller delta - remove entries that no longer matter instead of only adding.`
+const STATE_UPDATE_MISSING_GOAL_PROMPT = `This is the first StateUpdate for this session, so "goal" can't be left out - it's the only record of what the user actually asked for once this turn is folded away. Call StateUpdate again with a non-empty "goal".`
 
 type StateDelta = {
   goal?: string
@@ -154,6 +155,34 @@ function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillS
     blocked: applyListDelta(base.blocked, delta.blocked_add, delta.blocked_remove),
     files: applyListDelta(base.files, delta.files_add, delta.files_remove),
   }
+}
+
+// A missing or oversized delta is retried the same way regardless of step number. A
+// missing "goal" is only fatal on the very first fold: mergeState always carries an
+// existing goal forward on its own (delta.goal ?? base.goal), so later steps don't need
+// the model to repeat it - but on the first fold there is no base goal yet, and losing it
+// here means the task itself is gone once this turn is folded away.
+function isValidMergedState(state: SkillState | undefined, previous: SkillState | undefined) {
+  if (!state) return false
+  if (JSON.stringify(state).length > STATE_UPDATE_MAX_CHARS) return false
+  if (!previous && !state.goal) return false
+  return true
+}
+
+function stateUpdateNudge(delta: StateDelta | undefined, merged: SkillState | undefined, previous: SkillState | undefined) {
+  if (!delta) return STATE_UPDATE_RETRY_PROMPT
+  if (!previous && merged && !merged.goal) return STATE_UPDATE_MISSING_GOAL_PROMPT
+  return STATE_UPDATE_TOO_LARGE_PROMPT
+}
+
+// Deterministic fallback for the one failure a retry can't fully rule out: the model
+// never provides a usable first state at all. Reads the session's own first real prompt
+// (skipping synthetic continue messages) rather than the model's summary of it, so the
+// task survives even if StateUpdate never cooperates.
+function firstUserText(msgs: SessionV1.WithParts[]) {
+  const message = msgs.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "text" && !p.synthetic))
+  const text = message?.parts.find((p): p is SessionV1.TextPart => p.type === "text" && !p.synthetic)?.text
+  return text?.slice(0, 400)
 }
 
 function mcpResourceBase64Size(value: string) {
@@ -1430,18 +1459,18 @@ const layer = Layer.effect(
               const cleanStop =
                 handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
               if (!cleanStop) {
+                const previous = latestState(msgs)
                 let delta = extractStateDelta(
                   yield* MessageV2.parts(handle.message.id).pipe(Effect.provideService(Database.Service, database)),
                 )
-                let merged = delta ? mergeState(latestState(msgs), delta) : undefined
+                let merged = delta ? mergeState(previous, delta) : undefined
                 let retries = 0
                 while (
-                  (!delta || (merged && JSON.stringify(merged).length > STATE_UPDATE_MAX_CHARS)) &&
+                  !isValidMergedState(merged, previous) &&
                   retries < STATE_UPDATE_MAX_RETRIES &&
                   !handle.message.error
                 ) {
                   retries++
-                  const nudge = !delta ? STATE_UPDATE_RETRY_PROMPT : STATE_UPDATE_TOO_LARGE_PROMPT
                   result = yield* handle.process({
                     user: lastUser,
                     agent,
@@ -1449,22 +1478,32 @@ const layer = Layer.effect(
                     sessionID,
                     parentSessionID: session.parentID,
                     system,
-                    messages: [...modelMsgs, { role: "user" as const, content: nudge }],
+                    messages: [...modelMsgs, { role: "user" as const, content: stateUpdateNudge(delta, merged, previous) }],
                     tools,
                     model,
                   })
                   delta = extractStateDelta(
                     yield* MessageV2.parts(handle.message.id).pipe(Effect.provideService(Database.Service, database)),
                   )
-                  merged = delta ? mergeState(latestState(msgs), delta) : undefined
+                  merged = delta ? mergeState(previous, delta) : undefined
                 }
-                if (merged && JSON.stringify(merged).length <= STATE_UPDATE_MAX_CHARS) {
+                // Retries exhausted without a usable delta. On a later fold that's safe to
+                // skip - the previous state is untouched and still valid, and the overflow
+                // safety net remains. On the very first fold there is no previous state to
+                // fall back on, so seed at least the goal deterministically rather than
+                // silently starting the session's whole task history from nothing.
+                const final = isValidMergedState(merged, previous)
+                  ? merged
+                  : !previous
+                    ? { goal: firstUserText(msgs) ?? "", facts: [], completed: [], pending: [], blocked: [], files: [] }
+                    : undefined
+                if (final && (previous || final.goal)) {
                   yield* compaction.applyStateUpdate({
                     sessionID,
                     parentID: lastUser.id,
                     agent: lastUser.agent,
                     model: lastUser.model,
-                    state: merged,
+                    state: final,
                   })
                 }
               }

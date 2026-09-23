@@ -628,7 +628,7 @@ const layer = Layer.effect(
         messageID: summary.id,
         sessionID: input.sessionID,
         type: "text",
-        text: JSON.stringify(input.state, null, 2),
+        text: `Current execution state (your own record from the last turn - the conversation before it is gone):\n\n${JSON.stringify(input.state, null, 2)}`,
         time: { start: Date.now(), end: Date.now() },
       })
 
