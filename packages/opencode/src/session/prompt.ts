@@ -202,19 +202,51 @@ function extractStateDelta(parts: SessionV1.Part[]) {
   return part?.state.status === "completed" ? (part.state.input as StateDelta) : undefined
 }
 
+// Finds the first balanced {...} object in text, string-literal-aware so a stray brace
+// inside a quoted value (e.g. a goal that mentions a "{model}" field) can't unbalance it.
+// The overflow safety net's summary comes from a real LLM call asked to output "just the
+// JSON object, no markdown fences" - models don't reliably honor that, so anything trying
+// to parse that text back out has to tolerate a fence or trailing remark around it, not
+// just a label in front of it.
+function extractJsonObject(text: string) {
+  const start = text.indexOf("{")
+  if (start < 0) return undefined
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const char = text[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (char === "\\") {
+      escaped = true
+      continue
+    }
+    if (char === '"') {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === "{") depth++
+    else if (char === "}") {
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
+  }
+  return undefined
+}
+
 function latestState(msgs: SessionV1.WithParts[]) {
   const summary = msgs.findLast(
     (m) => m.info.role === "assistant" && m.info.summary === true && m.info.finish && !m.info.error,
   )
   const text = summary?.parts.find((p): p is SessionV1.TextPart => p.type === "text")?.text
   if (!text) return undefined
-  // The stored text is a human-readable label followed by the JSON state (see
-  // SessionCompaction.applyStateUpdate), not bare JSON - decode from the first "{" so
-  // that label doesn't make every fold after the first look like there's no previous
-  // state at all.
-  const start = text.indexOf("{")
-  if (start < 0) return undefined
-  return Option.getOrUndefined(Schema.decodeUnknownOption(Schema.fromJsonString(SkillStateSchema))(text.slice(start)))
+  const json = extractJsonObject(text)
+  if (!json) return undefined
+  return Option.getOrUndefined(Schema.decodeUnknownOption(Schema.fromJsonString(SkillStateSchema))(json))
 }
 
 // The tail retained by a skill_state fold is shown to the model for exactly one extra
