@@ -227,6 +227,11 @@ function latestState(msgs: SessionV1.WithParts[]) {
 function stripFoldedContent(msgs: SessionV1.WithParts[], activeID: MessageID) {
   return msgs.map((m) => {
     if (m.info.id === activeID) return m
+    // The compaction summary is also stored as an assistant text part - it must never be
+    // treated as "the assistant's own reasoning from an old turn," or the state itself
+    // (Sigma_t) gets stripped as if it were the discarded Rt, leaving the model with
+    // nothing to work from at all.
+    if (m.info.role === "assistant" && m.info.summary) return m
     return {
       ...m,
       parts: m.parts.flatMap((part) => {
