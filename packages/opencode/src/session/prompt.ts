@@ -9,6 +9,7 @@ import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { NotFoundError } from "@/storage/storage"
 
 import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -148,7 +149,10 @@ function applyListDelta(list: readonly string[], add: string[] | undefined, remo
 function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillState {
   const base = previous ?? { goal: "", facts: [], completed: [], pending: [], blocked: [], files: [] }
   return {
-    goal: delta.goal ?? base.goal,
+    // An empty string is "not provided" here just like an omitted key - the schema lets
+    // the model send either, and a model that sends "" for a field it isn't updating
+    // must not be able to wipe a real goal down to nothing.
+    goal: delta.goal?.trim() ? delta.goal : base.goal,
     facts: applyListDelta(base.facts, delta.facts_add, delta.facts_remove),
     completed: applyListDelta(base.completed, delta.completed_add, delta.completed_remove),
     pending: applyListDelta(base.pending, delta.pending_add, delta.pending_remove),
@@ -157,32 +161,20 @@ function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillS
   }
 }
 
-// A missing or oversized delta is retried the same way regardless of step number. A
-// missing "goal" is only fatal on the very first fold: mergeState always carries an
-// existing goal forward on its own (delta.goal ?? base.goal), so later steps don't need
-// the model to repeat it - but on the first fold there is no base goal yet, and losing it
-// here means the task itself is gone once this turn is folded away.
-function isValidMergedState(state: SkillState | undefined, previous: SkillState | undefined) {
+// A state without a goal is always invalid, not just on the first fold - mergeState
+// already carries a real goal forward on its own, so this only fires when one was never
+// established yet, which is exactly the case that must not be allowed through.
+function isValidMergedState(state: SkillState | undefined) {
   if (!state) return false
+  if (!state.goal) return false
   if (JSON.stringify(state).length > STATE_UPDATE_MAX_CHARS) return false
-  if (!previous && !state.goal) return false
   return true
 }
 
-function stateUpdateNudge(delta: StateDelta | undefined, merged: SkillState | undefined, previous: SkillState | undefined) {
+function stateUpdateNudge(delta: StateDelta | undefined, merged: SkillState | undefined) {
   if (!delta) return STATE_UPDATE_RETRY_PROMPT
-  if (!previous && merged && !merged.goal) return STATE_UPDATE_MISSING_GOAL_PROMPT
+  if (merged && !merged.goal) return STATE_UPDATE_MISSING_GOAL_PROMPT
   return STATE_UPDATE_TOO_LARGE_PROMPT
-}
-
-// Deterministic fallback for the one failure a retry can't fully rule out: the model
-// never provides a usable first state at all. Reads the session's own first real prompt
-// (skipping synthetic continue messages) rather than the model's summary of it, so the
-// task survives even if StateUpdate never cooperates.
-function firstUserText(msgs: SessionV1.WithParts[]) {
-  const message = msgs.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "text" && !p.synthetic))
-  const text = message?.parts.find((p): p is SessionV1.TextPart => p.type === "text" && !p.synthetic)?.text
-  return text?.slice(0, 400)
 }
 
 function mcpResourceBase64Size(value: string) {
@@ -340,6 +332,25 @@ const layer = Layer.effect(
         { concurrency: "unbounded", discard: true },
       )
       return parts
+    })
+
+    // Deterministic fallback for the one failure a StateUpdate retry can't fully rule
+    // out: the model never provides a usable goal at all. Reads the session's own first
+    // real prompt from full (uncompacted) history rather than the model's account of it,
+    // so the task survives even if StateUpdate never cooperates - and stays recoverable
+    // on any fold, not just the first, since a folded `msgs` view no longer has it.
+    const firstUserText = Effect.fn("SessionPrompt.firstUserText")(function* (sessionID: SessionID) {
+      const all = yield* sessions
+        .messages({ sessionID })
+        .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([] as SessionV1.WithParts[])))
+      const real = (m: SessionV1.WithParts) =>
+        m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
+      const message = all.find(real)
+      if (!message) return undefined
+      const text = message.parts.find((p): p is SessionV1.TextPart => p.type === "text" && !p.synthetic)?.text
+      if (text) return text.slice(0, 400)
+      const subtask = message.parts.find((p): p is SessionV1.SubtaskPart => p.type === "subtask")
+      return subtask?.prompt.slice(0, 400)
     })
 
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
@@ -1466,7 +1477,7 @@ const layer = Layer.effect(
                 let merged = delta ? mergeState(previous, delta) : undefined
                 let retries = 0
                 while (
-                  !isValidMergedState(merged, previous) &&
+                  !isValidMergedState(merged) &&
                   retries < STATE_UPDATE_MAX_RETRIES &&
                   !handle.message.error
                 ) {
@@ -1478,7 +1489,7 @@ const layer = Layer.effect(
                     sessionID,
                     parentSessionID: session.parentID,
                     system,
-                    messages: [...modelMsgs, { role: "user" as const, content: stateUpdateNudge(delta, merged, previous) }],
+                    messages: [...modelMsgs, { role: "user" as const, content: stateUpdateNudge(delta, merged) }],
                     tools,
                     model,
                   })
@@ -1487,17 +1498,23 @@ const layer = Layer.effect(
                   )
                   merged = delta ? mergeState(previous, delta) : undefined
                 }
-                // Retries exhausted without a usable delta. On a later fold that's safe to
-                // skip - the previous state is untouched and still valid, and the overflow
-                // safety net remains. On the very first fold there is no previous state to
-                // fall back on, so seed at least the goal deterministically rather than
-                // silently starting the session's whole task history from nothing.
-                const final = isValidMergedState(merged, previous)
+                // Retries exhausted. An oversized merge is safe to just skip - the
+                // previous state is untouched and still valid, and the overflow safety
+                // net remains. A missing goal (only possible when there's no previous
+                // state to fall back on either - mergeState always carries a real one
+                // forward) needs a deterministic seed instead of silently starting the
+                // session's whole task history from nothing.
+                const final = isValidMergedState(merged)
                   ? merged
-                  : !previous
-                    ? { goal: firstUserText(msgs) ?? "", facts: [], completed: [], pending: [], blocked: [], files: [] }
-                    : undefined
-                if (final && (previous || final.goal)) {
+                  : merged && JSON.stringify(merged).length > STATE_UPDATE_MAX_CHARS
+                    ? undefined
+                    : yield* Effect.gen(function* () {
+                        const goal = previous?.goal || (yield* firstUserText(sessionID)) || ""
+                        return goal
+                          ? { goal, facts: previous?.facts ?? [], completed: previous?.completed ?? [], pending: previous?.pending ?? [], blocked: previous?.blocked ?? [], files: previous?.files ?? [] }
+                          : undefined
+                      })
+                if (final) {
                   yield* compaction.applyStateUpdate({
                     sessionID,
                     parentID: lastUser.id,
