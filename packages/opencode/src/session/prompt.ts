@@ -82,24 +82,79 @@ IMPORTANT:
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
 // SKILL.state (arXiv:2608.26263): the state patch is produced in the same generation as
-// the turn's real action(s), not by a separate compaction call afterward.
+// the turn's real action(s), not by a separate compaction call afterward. The model
+// reports a delta (what changed); the runtime merges it onto the state it already has,
+// mirroring the paper's Sigma(t+1) = Sigma(t) (+) Delta-Sigma(t) rather than trusting the
+// model to retype the whole state correctly every turn.
 const STATE_UPDATE_SCHEMA = {
   type: "object",
   properties: {
-    goal: { type: "string", description: "One sentence: what the user is trying to accomplish." },
-    facts: { type: "array", items: { type: "string" }, description: "Constraints, decisions, or facts worth keeping." },
-    completed: { type: "array", items: { type: "string" }, description: "Finished steps or verified changes." },
-    pending: { type: "array", items: { type: "string" }, description: "Next concrete steps, most urgent first." },
-    blocked: { type: "array", items: { type: "string" }, description: "Blockers or open questions." },
-    files: { type: "array", items: { type: "string" }, description: "Relevant file paths and why they matter." },
+    goal: { type: "string", description: "Replace the current goal - only include this if it changed." },
+    facts_add: { type: "array", items: { type: "string" }, description: "Constraints/decisions/facts to add." },
+    facts_remove: { type: "array", items: { type: "string" }, description: "Facts to remove, matched exactly." },
+    completed_add: { type: "array", items: { type: "string" }, description: "Finished steps to add." },
+    completed_remove: { type: "array", items: { type: "string" }, description: "Completed entries to remove." },
+    pending_add: { type: "array", items: { type: "string" }, description: "Next steps to add." },
+    pending_remove: { type: "array", items: { type: "string" }, description: "Pending entries to remove." },
+    blocked_add: { type: "array", items: { type: "string" }, description: "Blockers to add." },
+    blocked_remove: { type: "array", items: { type: "string" }, description: "Blocked entries to remove (resolved)." },
+    files_add: { type: "array", items: { type: "string" }, description: "Relevant files to add." },
+    files_remove: { type: "array", items: { type: "string" }, description: "File entries to remove." },
   },
-  required: ["goal"],
   additionalProperties: false,
 } satisfies JSONSchema7
 
-const STATE_UPDATE_DESCRIPTION = `Record the complete current execution state. Call this every turn alongside your real action(s) - on the next turn you will not see this conversation again, only this recorded state and the latest observation. Always give the full up-to-date state, not just what changed: merge, generalize, or drop entries instead of only appending, so the state stays bounded rather than growing every turn.`
+const STATE_UPDATE_DESCRIPTION = `Report what changed in the execution state this turn, as a delta - add/remove entries for facts, completed, pending, blocked, and files; include "goal" only if it changed. The runtime merges this onto the state it already has. Call this every turn, even with an empty delta if nothing changed - on the next turn you will only see the merged state and the latest observation, not this conversation.`
 
-const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see your last recorded state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, with the complete current state (goal, facts, completed, pending, blocked, files).`
+const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see the merged state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, reporting only what changed (add/remove entries), not the full state. If you skip it, you will be asked to call it again before the session continues.`
+
+const STATE_UPDATE_MAX_RETRIES = 1
+const STATE_UPDATE_MAX_CHARS = 4_000
+const STATE_UPDATE_RETRY_PROMPT = `You did not call StateUpdate this turn. Call it now, reporting the delta for this turn (it can be empty if nothing changed), before continuing.`
+const STATE_UPDATE_TOO_LARGE_PROMPT = `The state produced by your last StateUpdate call is too large. Call it again with a smaller delta - remove entries that no longer matter instead of only adding.`
+
+type StateDelta = {
+  goal?: string
+  facts_add?: string[]
+  facts_remove?: string[]
+  completed_add?: string[]
+  completed_remove?: string[]
+  pending_add?: string[]
+  pending_remove?: string[]
+  blocked_add?: string[]
+  blocked_remove?: string[]
+  files_add?: string[]
+  files_remove?: string[]
+}
+
+const SkillStateSchema = Schema.Struct({
+  goal: Schema.String,
+  facts: Schema.Array(Schema.String),
+  completed: Schema.Array(Schema.String),
+  pending: Schema.Array(Schema.String),
+  blocked: Schema.Array(Schema.String),
+  files: Schema.Array(Schema.String),
+})
+type SkillState = Schema.Schema.Type<typeof SkillStateSchema>
+
+function applyListDelta(list: readonly string[], add: string[] | undefined, remove: string[] | undefined) {
+  const removed = new Set(remove ?? [])
+  const kept = list.filter((item) => !removed.has(item))
+  const additions = (add ?? []).filter((item) => !kept.includes(item))
+  return [...kept, ...additions]
+}
+
+function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillState {
+  const base = previous ?? { goal: "", facts: [], completed: [], pending: [], blocked: [], files: [] }
+  return {
+    goal: delta.goal ?? base.goal,
+    facts: applyListDelta(base.facts, delta.facts_add, delta.facts_remove),
+    completed: applyListDelta(base.completed, delta.completed_add, delta.completed_remove),
+    pending: applyListDelta(base.pending, delta.pending_add, delta.pending_remove),
+    blocked: applyListDelta(base.blocked, delta.blocked_add, delta.blocked_remove),
+    files: applyListDelta(base.files, delta.files_add, delta.files_remove),
+  }
+}
 
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
@@ -119,36 +174,49 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
-function capturedStateUpdate(msgs: SessionV1.WithParts[], assistantID: MessageID) {
-  const message = msgs.find((m) => m.info.role === "assistant" && m.info.id === assistantID)
-  const part = message?.parts.find(
+function extractStateDelta(parts: SessionV1.Part[]) {
+  const part = parts.findLast(
     (p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "StateUpdate" && p.state.status === "completed",
   )
-  return part?.state.status === "completed" ? part.state.input : undefined
+  return part?.state.status === "completed" ? (part.state.input as StateDelta) : undefined
+}
+
+function latestState(msgs: SessionV1.WithParts[]) {
+  const summary = msgs.findLast(
+    (m) => m.info.role === "assistant" && m.info.summary === true && m.info.finish && !m.info.error,
+  )
+  const text = summary?.parts.find((p): p is SessionV1.TextPart => p.type === "text")?.text
+  if (!text) return undefined
+  return Option.getOrUndefined(Schema.decodeUnknownOption(Schema.fromJsonString(SkillStateSchema))(text))
 }
 
 // The tail retained by a skill_state fold is shown to the model for exactly one extra
-// step so it still has the latest observation, then it's gone. Media in that observation
-// (screenshots, images a tool read) is already covered by whatever the state text says
-// about it, so re-sending the raw bytes for that one extra step is pure waste - strip it
-// from the request only, leaving the stored history untouched.
-function stripFoldedMedia(msgs: SessionV1.WithParts[], activeID: MessageID) {
+// step so it still has the latest observation, then it's gone. Two things in that
+// observation don't need to survive that one extra step: media (screenshots, images a
+// tool read) is already covered by whatever the state text says about it, and the
+// assistant's own text/reasoning from that turn is exactly the "Rt" the paper discards
+// once its state patch is produced - only the tool calls and their results (the actual
+// environment observation) are worth showing again.
+function stripFoldedContent(msgs: SessionV1.WithParts[], activeID: MessageID) {
   return msgs.map((m) => {
     if (m.info.id === activeID) return m
     return {
       ...m,
-      parts: m.parts.map((part) => {
+      parts: m.parts.flatMap((part) => {
+        if (m.info.role === "assistant" && (part.type === "text" || part.type === "reasoning")) return []
         if (part.type === "file" && MessageV2.isMedia(part.mime))
-          return {
-            id: part.id,
-            sessionID: part.sessionID,
-            messageID: part.messageID,
-            type: "text" as const,
-            text: `[Attached ${part.mime}: ${part.filename ?? "file"}]`,
-          }
+          return [
+            {
+              id: part.id,
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              type: "text" as const,
+              text: `[Attached ${part.mime}: ${part.filename ?? "file"}]`,
+            },
+          ]
         if (part.type === "tool" && part.state.status === "completed" && part.state.attachments?.length)
-          return { ...part, state: { ...part.state, attachments: [] } }
-        return part
+          return [{ ...part, state: { ...part.state, attachments: [] } }]
+        return [part]
       }),
     }
   })
@@ -1213,25 +1281,16 @@ const layer = Layer.effect(
             continue
           }
 
-          if (lastFinished && lastFinished.summary !== true) {
-            const skillState = (yield* config.get()).experimental?.skill_state === true
-            const stateUpdate = skillState ? capturedStateUpdate(msgs, lastFinished.id) : undefined
-            if (stateUpdate) {
-              yield* compaction.applyStateUpdate({
-                sessionID,
-                parentID: lastUser.id,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                state: stateUpdate,
-              })
-              continue
-            }
-            // skill_state falls back here when the model didn't call StateUpdate this
-            // turn - the overflow check is the same safety net non-skill_state sessions use.
-            if (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })) {
-              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-              continue
-            }
+          // skill_state folds inline, right after handle.process() below, once the turn's
+          // own StateUpdate call is known - so this is just the plain overflow safety net
+          // both modes fall back to (skill_state too, if StateUpdate retries were exhausted).
+          if (
+            lastFinished &&
+            lastFinished.summary !== true &&
+            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+          ) {
+            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            continue
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1329,7 +1388,7 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(skillState ? stripFoldedMedia(msgs, lastUser.id) : msgs, model),
+              MessageV2.toModelMessagesEffect(skillState ? stripFoldedContent(msgs, lastUser.id) : msgs, model),
             ])
             const system = [
               ...env,
@@ -1340,7 +1399,7 @@ const layer = Layer.effect(
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             if (skillState) system.push(SKILL_STATE_SYSTEM_PROMPT)
-            const result = yield* handle.process({
+            let result = yield* handle.process({
               user: lastUser,
               agent,
               permission: session.permission,
@@ -1361,6 +1420,54 @@ const layer = Layer.effect(
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
               return "break" as const
+            }
+
+            // The paper treats a valid state patch as required every step, not optional -
+            // an invalid or missing one gets rolled back and retried, not silently skipped.
+            // A clean stop means this was the final answer; there's no next step for a
+            // state to bound, so don't make the model pay for one.
+            if (skillState && !handle.message.error) {
+              const cleanStop =
+                handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+              if (!cleanStop) {
+                let delta = extractStateDelta(
+                  yield* MessageV2.parts(handle.message.id).pipe(Effect.provideService(Database.Service, database)),
+                )
+                let merged = delta ? mergeState(latestState(msgs), delta) : undefined
+                let retries = 0
+                while (
+                  (!delta || (merged && JSON.stringify(merged).length > STATE_UPDATE_MAX_CHARS)) &&
+                  retries < STATE_UPDATE_MAX_RETRIES &&
+                  !handle.message.error
+                ) {
+                  retries++
+                  const nudge = !delta ? STATE_UPDATE_RETRY_PROMPT : STATE_UPDATE_TOO_LARGE_PROMPT
+                  result = yield* handle.process({
+                    user: lastUser,
+                    agent,
+                    permission: session.permission,
+                    sessionID,
+                    parentSessionID: session.parentID,
+                    system,
+                    messages: [...modelMsgs, { role: "user" as const, content: nudge }],
+                    tools,
+                    model,
+                  })
+                  delta = extractStateDelta(
+                    yield* MessageV2.parts(handle.message.id).pipe(Effect.provideService(Database.Service, database)),
+                  )
+                  merged = delta ? mergeState(latestState(msgs), delta) : undefined
+                }
+                if (merged && JSON.stringify(merged).length <= STATE_UPDATE_MAX_CHARS) {
+                  yield* compaction.applyStateUpdate({
+                    sessionID,
+                    parentID: lastUser.id,
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                    state: merged,
+                  })
+                }
+              }
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
