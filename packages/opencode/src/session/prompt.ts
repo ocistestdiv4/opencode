@@ -91,20 +91,33 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 // Fields are coding-implementation-specific rather than a generic task template, following
 // the paper's own approach: its InterCode CTF evaluation uses a fixed 5-field schema shaped
 // around that domain (discovered_flags, tested_hypotheses, active_files, working_dir,
-// cmd_summary), not one universal schema. root_cause/next_step are single evolving values
-// (not lists) because a coding agent should carry exactly one current hypothesis and one
-// concrete next action, not an accumulating log of past ones.
+// cmd_summary), not one universal schema. root_causes/next_steps are lists, matching the
+// paper's own tested_hypotheses field, so the model can track several hypotheses tried or
+// steps queued at once instead of a single value overwriting whatever came before it.
 const STATE_UPDATE_SCHEMA = {
   type: "object",
   properties: {
     goal: { type: "string", description: "Replace the current goal - only include this if it changed." },
-    root_cause: {
-      type: "string",
-      description: "Replace the current best understanding of the root cause / design direction - only if it changed.",
+    root_causes_add: {
+      type: "array",
+      items: { type: "string" },
+      description: "Hypotheses about the root cause / design direction to add, ruled out or not.",
     },
-    next_step: {
-      type: "string",
-      description: "Replace the single next concrete action - only if it changed.",
+    root_causes_remove: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Hypothesis entries to remove. Once the real root cause is confirmed, remove the other, disproven hypotheses - keep only the confirmed one.",
+    },
+    next_steps_add: {
+      type: "array",
+      items: { type: "string" },
+      description: "Next concrete actions to queue, most urgent first.",
+    },
+    next_steps_remove: {
+      type: "array",
+      items: { type: "string" },
+      description: "Next-step entries to remove once actioned, whether they succeeded or not - a done step is not a next step. If it needs a follow-up, add a new entry instead of leaving the old one.",
     },
     modified_files_add: {
       type: "array",
@@ -122,7 +135,8 @@ const STATE_UPDATE_SCHEMA = {
     tests_failing_remove: {
       type: "array",
       items: { type: "string" },
-      description: "Failing-test entries to remove (e.g. now fixed).",
+      description:
+        "Failing-test entries to remove. When a test starts passing, remove it here and add it to tests_passing_add in the same call - don't leave it listed as both.",
     },
     blockers_add: { type: "array", items: { type: "string" }, description: "Blockers to add." },
     blockers_remove: { type: "array", items: { type: "string" }, description: "Blocked entries to remove (resolved)." },
@@ -130,9 +144,9 @@ const STATE_UPDATE_SCHEMA = {
   additionalProperties: false,
 } satisfies JSONSchema7
 
-const STATE_UPDATE_DESCRIPTION = `Report what changed in the execution state this turn, as a delta - add/remove entries for modified files, passing/failing tests, and blockers; include "goal"/"root_cause"/"next_step" only if they changed. The runtime merges this onto the state it already has. Call this every turn, even with an empty delta if nothing changed - on the next turn you will only see the merged state and the latest observation, not this conversation.`
+const STATE_UPDATE_DESCRIPTION = `Report what changed in the execution state this turn, as a delta - add/remove entries for root-cause hypotheses, next steps, modified files, passing/failing tests, and blockers; include "goal" only if it changed. The runtime merges this onto the state it already has. Call this every turn, even with an empty delta if nothing changed - on the next turn you will only see the merged state and the latest observation, not this conversation.`
 
-const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see the merged state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, reporting only what changed (add/remove entries, or a replacement value for goal/root_cause/next_step), not the full state. If you skip it, you will be asked to call it again before the session continues.`
+const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see the merged state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, reporting only what changed (add/remove entries, or a replacement value for goal), not the full state. If you skip it, you will be asked to call it again before the session continues.`
 
 const STATE_UPDATE_MAX_RETRIES = 1
 const STATE_UPDATE_MAX_CHARS = 4_000
@@ -142,8 +156,10 @@ const STATE_UPDATE_MISSING_GOAL_PROMPT = `This is the first StateUpdate for this
 
 type StateDelta = {
   goal?: string
-  root_cause?: string
-  next_step?: string
+  root_causes_add?: string[]
+  root_causes_remove?: string[]
+  next_steps_add?: string[]
+  next_steps_remove?: string[]
   modified_files_add?: string[]
   modified_files_remove?: string[]
   tests_passing_add?: string[]
@@ -156,8 +172,8 @@ type StateDelta = {
 
 const SkillStateSchema = Schema.Struct({
   goal: Schema.String,
-  root_cause: Schema.String,
-  next_step: Schema.String,
+  root_causes: Schema.Array(Schema.String),
+  next_steps: Schema.Array(Schema.String),
   modified_files: Schema.Array(Schema.String),
   tests_passing: Schema.Array(Schema.String),
   tests_failing: Schema.Array(Schema.String),
@@ -175,8 +191,8 @@ function applyListDelta(list: readonly string[], add: string[] | undefined, remo
 function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillState {
   const base = previous ?? {
     goal: "",
-    root_cause: "",
-    next_step: "",
+    root_causes: [],
+    next_steps: [],
     modified_files: [],
     tests_passing: [],
     tests_failing: [],
@@ -187,8 +203,8 @@ function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillS
     // the model send either, and a model that sends "" for a field it isn't updating
     // must not be able to wipe a real goal down to nothing.
     goal: delta.goal?.trim() ? delta.goal : base.goal,
-    root_cause: delta.root_cause?.trim() ? delta.root_cause : base.root_cause,
-    next_step: delta.next_step?.trim() ? delta.next_step : base.next_step,
+    root_causes: applyListDelta(base.root_causes, delta.root_causes_add, delta.root_causes_remove),
+    next_steps: applyListDelta(base.next_steps, delta.next_steps_add, delta.next_steps_remove),
     modified_files: applyListDelta(base.modified_files, delta.modified_files_add, delta.modified_files_remove),
     tests_passing: applyListDelta(base.tests_passing, delta.tests_passing_add, delta.tests_passing_remove),
     tests_failing: applyListDelta(base.tests_failing, delta.tests_failing_add, delta.tests_failing_remove),
@@ -1591,8 +1607,8 @@ const layer = Layer.effect(
                         return goal
                           ? {
                               goal,
-                              root_cause: previous?.root_cause ?? "",
-                              next_step: previous?.next_step ?? "",
+                              root_causes: previous?.root_causes ?? [],
+                              next_steps: previous?.next_steps ?? [],
                               modified_files: previous?.modified_files ?? [],
                               tests_passing: previous?.tests_passing ?? [],
                               tests_failing: previous?.tests_failing ?? [],

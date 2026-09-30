@@ -177,8 +177,8 @@ const STATE_TEMPLATE = `Output exactly the JSON object shown inside <template>, 
 <template>
 {
   "goal": "[one sentence: what the user is trying to accomplish]",
-  "root_cause": "[current best understanding of the root cause / design direction, terse, or empty string]",
-  "next_step": "[the single next concrete action, or empty string]",
+  "root_causes": ["[hypothesis about the root cause / design direction, ruled out or not]"],
+  "next_steps": ["[next concrete action, most urgent first]"],
   "modified_files": ["[path: what changed]"],
   "tests_passing": ["[test name or description confirmed passing]"],
   "tests_failing": ["[test name or description confirmed failing]"],
@@ -195,7 +195,8 @@ const STATE_UPDATE_INSTRUCTIONS = `The <prior-state> is the execution state befo
 
 When updating:
 - Move tests from "tests_failing" to "tests_passing" once confirmed passing; drop tests that no longer matter for future steps.
-- Update "root_cause" and "next_step" to reflect the current understanding, replacing the old value rather than appending to it.
+- Keep every hypothesis tried in "root_causes" so a disproven one isn't tested again, but once the real root cause is confirmed, drop the other, disproven hypotheses and keep only the confirmed one.
+- Remove a "next_steps" entry once it's been actioned, whether it succeeded or not; add a new entry for any follow-up instead of leaving the old one in place.
 - The <conversation> is more recent than the <prior-state>. Where they conflict, the conversation wins.
 - Resolve blockers that no longer apply and drop them.
 - Keep the state minimal - it must not grow every step.`
