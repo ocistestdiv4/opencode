@@ -177,23 +177,25 @@ const STATE_TEMPLATE = `Output exactly the JSON object shown inside <template>, 
 <template>
 {
   "goal": "[one sentence: what the user is trying to accomplish]",
-  "facts": ["[constraint, decision, or fact worth keeping, terse]"],
-  "completed": ["[finished step or verified change]"],
-  "pending": ["[next concrete step, most urgent first]"],
-  "blocked": ["[blocker or open question]"],
-  "files": ["[path: why it matters]"]
+  "root_cause": "[current best understanding of the root cause / design direction, terse, or empty string]",
+  "next_step": "[the single next concrete action, or empty string]",
+  "modified_files": ["[path: what changed]"],
+  "tests_passing": ["[test name or description confirmed passing]"],
+  "tests_failing": ["[test name or description confirmed failing]"],
+  "blockers": ["[blocker or open question]"]
 }
 </template>
 
 Rules:
-- Valid JSON only, matching the template's keys exactly. Use an empty array when there is nothing for a key.
+- Valid JSON only, matching the template's keys exactly. Use an empty array/string when there is nothing for a key.
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
 - This is bounded execution state, not a transcript: merge, generalize, or drop entries instead of only appending, so the state does not grow every step.`
 
 const STATE_UPDATE_INSTRUCTIONS = `The <prior-state> is the execution state before the <conversation>. Produce a new state object that folds the <conversation> into it. The <prior-state> is discarded after this: anything you do not carry into the new state is lost.
 
 When updating:
-- Move finished "pending" items into "completed"; drop "completed" items that no longer matter for future steps.
+- Move tests from "tests_failing" to "tests_passing" once confirmed passing; drop tests that no longer matter for future steps.
+- Update "root_cause" and "next_step" to reflect the current understanding, replacing the old value rather than appending to it.
 - The <conversation> is more recent than the <prior-state>. Where they conflict, the conversation wins.
 - Resolve blockers that no longer apply and drop them.
 - Keep the state minimal - it must not grow every step.`
