@@ -182,8 +182,7 @@ const STATE_TEMPLATE = `Output exactly the JSON object shown inside <template>, 
   "modified_files": ["[path: what changed]"],
   "tests_passing": ["[test name or description confirmed passing]"],
   "tests_failing": ["[test name or description confirmed failing]"],
-  "blockers": ["[blocker or open question]"],
-  "notes": ["[terse, non-actionable background fact that doesn't fit the other fields - never a task]"]
+  "blockers": ["[blocker or open question]"]
 }
 </template>
 
@@ -198,7 +197,6 @@ When updating:
 - Move tests from "tests_failing" to "tests_passing" once confirmed passing; drop tests that no longer matter for future steps.
 - Keep every hypothesis tried in "root_causes" so a disproven one isn't tested again, but once the real root cause is confirmed, drop the other, disproven hypotheses and keep only the confirmed one.
 - Remove a "next_steps" entry once it's been actioned, whether it succeeded or not; add a new entry for any follow-up instead of leaving the old one in place.
-- Keep "notes" short and only for background facts that don't belong in another field - never tasks or actions - and drop entries once they stop being relevant to what's currently happening.
 - The <conversation> is more recent than the <prior-state>. Where they conflict, the conversation wins.
 - Resolve blockers that no longer apply and drop them.
 - Keep the state minimal - it must not grow every step.`

@@ -140,22 +140,11 @@ const STATE_UPDATE_SCHEMA = {
     },
     blockers_add: { type: "array", items: { type: "string" }, description: "Blockers to add." },
     blockers_remove: { type: "array", items: { type: "string" }, description: "Blocked entries to remove (resolved)." },
-    notes_add: {
-      type: "array",
-      items: { type: "string" },
-      description:
-        "Terse, non-actionable background facts to add that don't fit the other fields (constraints, decisions, dependencies) - never tasks or actions, that's what next_steps is for.",
-    },
-    notes_remove: {
-      type: "array",
-      items: { type: "string" },
-      description: "Note entries to remove once no longer relevant to what you're currently doing - keep this short.",
-    },
   },
   additionalProperties: false,
 } satisfies JSONSchema7
 
-const STATE_UPDATE_DESCRIPTION = `Report what changed in the execution state this turn, as a delta - add/remove entries for root-cause hypotheses, next steps, modified files, passing/failing tests, blockers, and notes; include "goal" only if it changed. The runtime merges this onto the state it already has. Call this every turn, even with an empty delta if nothing changed - on the next turn you will only see the merged state and the latest observation, not this conversation.`
+const STATE_UPDATE_DESCRIPTION = `Report what changed in the execution state this turn, as a delta - add/remove entries for root-cause hypotheses, next steps, modified files, passing/failing tests, and blockers; include "goal" only if it changed. The runtime merges this onto the state it already has. Call this every turn, even with an empty delta if nothing changed - on the next turn you will only see the merged state and the latest observation, not this conversation.`
 
 const SKILL_STATE_SYSTEM_PROMPT = `IMPORTANT: This session keeps a bounded execution state instead of full conversation history. After this turn you will only see the merged state and the latest observation - not the conversation that led here. Call the StateUpdate tool every turn, alongside any other tools you call, reporting only what changed (add/remove entries, or a replacement value for goal), not the full state. If you skip it, you will be asked to call it again before the session continues.`
 
@@ -179,8 +168,6 @@ type StateDelta = {
   tests_failing_remove?: string[]
   blockers_add?: string[]
   blockers_remove?: string[]
-  notes_add?: string[]
-  notes_remove?: string[]
 }
 
 const SkillStateSchema = Schema.Struct({
@@ -191,7 +178,6 @@ const SkillStateSchema = Schema.Struct({
   tests_passing: Schema.Array(Schema.String),
   tests_failing: Schema.Array(Schema.String),
   blockers: Schema.Array(Schema.String),
-  notes: Schema.Array(Schema.String),
 })
 type SkillState = Schema.Schema.Type<typeof SkillStateSchema>
 
@@ -211,7 +197,6 @@ function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillS
     tests_passing: [],
     tests_failing: [],
     blockers: [],
-    notes: [],
   }
   return {
     // An empty string is "not provided" here just like an omitted key - the schema lets
@@ -224,7 +209,6 @@ function mergeState(previous: SkillState | undefined, delta: StateDelta): SkillS
     tests_passing: applyListDelta(base.tests_passing, delta.tests_passing_add, delta.tests_passing_remove),
     tests_failing: applyListDelta(base.tests_failing, delta.tests_failing_add, delta.tests_failing_remove),
     blockers: applyListDelta(base.blockers, delta.blockers_add, delta.blockers_remove),
-    notes: applyListDelta(base.notes, delta.notes_add, delta.notes_remove),
   }
 }
 
@@ -1629,7 +1613,6 @@ const layer = Layer.effect(
                               tests_passing: previous?.tests_passing ?? [],
                               tests_failing: previous?.tests_failing ?? [],
                               blockers: previous?.blockers ?? [],
-                              notes: previous?.notes ?? [],
                             }
                           : undefined
                       })
